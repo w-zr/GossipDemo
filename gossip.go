@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	fanOut         = 1
+	fanOut         = 3
 	gossipInterval = time.Millisecond * 50
 )
 
@@ -40,41 +40,42 @@ func NewServer(network, address string, seedNodes []string) *Gossip {
 	}
 
 	s.seedNodes = s.removeSelfAddress(seedNodes)
+	s.AddLocalState("key", "value")
 	return s
 }
 
-func (s *Gossip) GetSnapshot() Snapshot {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.snapshot.Clone()
+func (g *Gossip) GetSnapshot() Snapshot {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.snapshot.Clone()
 }
 
-func (s *Gossip) removeSelfAddress(seedNodes []string) []string {
-	seeds := make([]string, 0)
-	for _, seed := range seedNodes {
-		if seed != s.localAddress.Address {
-			seeds = append(seeds, seed)
+func (g *Gossip) removeSelfAddress(targets []string) []string {
+	for i, target := range targets {
+		if target == g.localAddress.Address {
+			seeds := append(targets[:i], targets[i+1:]...)
+			return seeds
 		}
 	}
-	return seeds
+	return targets
 }
 
-func (s *Gossip) AddLocalState(key string, value string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (g *Gossip) AddLocalState(key string, value string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 
-	if _, ok := s.snapshot[s.localAddress]; !ok {
-		s.snapshot[s.localAddress] = make(Info)
+	if _, ok := g.snapshot[g.localAddress]; !ok {
+		g.snapshot[g.localAddress] = make(Info)
 	}
-	s.snapshot[s.localAddress][key] = value
+	g.snapshot[g.localAddress][key] = VersionedValue{g.version, value}
+	g.version++
 }
 
-func (s *Gossip) Start() {
-	l, err := net.Listen(s.localAddress.Network, s.localAddress.Address)
+func (g *Gossip) Start() {
+	l, err := net.Listen(g.localAddress.Network, g.localAddress.Address)
 	if err != nil {
 		log.Fatal("Network error:", err)
 	}
-	log.Println("start gossip server on", l.Addr())
 	go func() {
 		for {
 			conn, err := l.Accept()
@@ -82,98 +83,143 @@ func (s *Gossip) Start() {
 				log.Println("gossip server: accept error:", err)
 				return
 			}
-			go s.handleGossipRequest(conn)
+			go g.handleGossipRequest(conn)
 		}
 	}()
-	go s.startGossip()
+	go g.startGossip()
 }
 
-func (s *Gossip) startGossip() {
-	s.doGossip()
+func (g *Gossip) startGossip() {
+	g.doGossip()
 	ticker := time.NewTicker(gossipInterval)
 	for {
 		<-ticker.C
-		s.doGossip()
+		g.doGossip()
 	}
 }
 
-func (s *Gossip) handleGossipRequest(conn net.Conn) {
+func (g *Gossip) handleGossipRequest(conn net.Conn) {
 	f := codec.NewCodecFuncMap[codec.GobType]
 	cc := f(conn)
 	for {
-		snapshot := make(Snapshot)
-		err := cc.Read(&snapshot)
-		if err != nil {
+		maxVersions := make(map[Address]uint64)
+		if err := cc.Read(&maxVersions); err != nil {
 			log.Fatal("gossip server: read failed")
 			return
 		}
-		diff := delta(s.GetSnapshot(), snapshot)
-		err = cc.Write(&diff)
-		if err != nil {
+
+		g.mu.Lock()
+		for addr := range maxVersions {
+			if _, ok := g.snapshot[addr]; !ok {
+				g.snapshot[addr] = make(Info)
+			}
+		}
+		g.mu.Unlock()
+
+		diff := g.getMissingAndNodeStatesHigherThan(maxVersions)
+		if err := cc.Write(&diff); err != nil {
 			log.Fatal("gossip server: write failed")
 			return
 		}
-		s.merge(snapshot)
 	}
 }
 
-func (s *Gossip) doGossip() {
-	knownNodes := s.liveNodes()
+func (g *Gossip) doGossip() {
+	knownNodes := g.liveNodes()
 	if len(knownNodes) == 0 {
-		s.sendGossip(s.seedNodes, fanOut)
+		g.sendGossip(g.seedNodes, fanOut)
 	} else {
-		s.sendGossip(knownNodes, fanOut)
+		g.sendGossip(knownNodes, fanOut)
 	}
 }
 
-func (s *Gossip) liveNodes() []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (g *Gossip) liveNodes() []string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	var liveNodes []string
-	for key := range s.snapshot {
+	for key := range g.snapshot {
 		liveNodes = append(liveNodes, key.Address)
 	}
-	return s.removeSelfAddress(liveNodes)
+	return g.removeSelfAddress(liveNodes)
 }
 
-func (s *Gossip) sendGossip(targets []string, fanOut int) {
+func (g *Gossip) sendGossip(targets []string, fanOut int) {
 	if len(targets) == 0 {
 		return
 	}
 
 	for i := 0; i < fanOut; i++ {
 		r := rand.Intn(len(targets))
-		if err := s.sendGossipTo(targets[r]); err != nil {
-			for i, c := range s.peers {
+		if err := g.sendKnownVersions(targets[r]); err != nil {
+			for i, c := range g.peers {
 				if c.remote.Address == targets[r] {
-					s.peers = append(s.peers[:i], s.peers[i+1:]...)
+					g.peers = append(g.peers[:i], g.peers[i+1:]...)
 				}
 			}
 		}
 	}
 }
 
-func (s *Gossip) sendGossipTo(target string) error {
+func (g *Gossip) getOrCreateClient(target string) (*client, error) {
 	var peer *client
-	for _, c := range s.peers {
+	for _, c := range g.peers {
 		if c.remote.Address == target {
 			peer = c
 		}
 	}
 	if peer == nil {
 		var err error
-		peer, err = Dial(s.localAddress.Network, target)
+		peer, err = Dial(g.localAddress.Network, target)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		peer.server = s
-		peer.remote = Address{s.localAddress.Network, target}
-		s.peers = append(s.peers, peer)
+		peer.server = g
+		peer.remote = Address{g.localAddress.Network, target}
+		g.peers = append(g.peers, peer)
 		go peer.receive()
 	}
+	return peer, nil
+}
 
-	peer.send(s.GetSnapshot())
+func (g *Gossip) sendKnownVersions(target string) error {
+	if peer, err := g.getOrCreateClient(target); err != nil {
+		return err
+	} else {
+		peer.sendKnownVersions(g.getMaxKnownNodeVersions())
+	}
 	return nil
+}
+
+func (g *Gossip) getMaxKnownNodeVersions() map[Address]uint64 {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	maxKnownNodeVersions := make(map[Address]uint64)
+	for addr, info := range g.snapshot {
+		maxKnownNodeVersions[addr] = info.MaxVersion()
+	}
+	return maxKnownNodeVersions
+}
+
+func (g *Gossip) getMissingAndNodeStatesHigherThan(nodeMaxVersions map[Address]uint64) Snapshot {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	diff := make(Snapshot)
+	for addr, maxVersion := range nodeMaxVersions {
+		if nodeState, ok := g.snapshot[addr]; !ok {
+			continue
+		} else {
+			diffState := nodeState.StatesGreaterThan(maxVersion)
+			if len(diffState) != 0 {
+				diff[addr] = diffState
+			}
+		}
+	}
+	for addr := range g.snapshot {
+		if _, ok := nodeMaxVersions[addr]; !ok {
+			diff[addr] = g.snapshot[addr].Clone()
+		}
+	}
+	return diff
 }
 
 func delta(from, to Snapshot) Snapshot {
@@ -186,10 +232,14 @@ func delta(from, to Snapshot) Snapshot {
 		fromMap := from[addr]
 		toMap := to[addr]
 		diffMap := make(Info)
-		for key, value := range fromMap {
-			if _, ok := toMap[key]; !ok {
-				diffMap[key] = value
+		for key, fromValue := range fromMap {
+			if toValue, ok := toMap[key]; !ok {
+				diffMap[key] = fromValue
 				continue
+			} else {
+				if fromValue.Version > toValue.Version {
+					diffMap[key] = fromValue
+				}
 			}
 		}
 		if len(diffMap) != 0 {
@@ -199,19 +249,19 @@ func delta(from, to Snapshot) Snapshot {
 	return diff
 }
 
-func (s *Gossip) merge(other Snapshot) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.snapshot == nil {
-		s.snapshot = make(Snapshot)
+func (g *Gossip) merge(other Snapshot) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.snapshot == nil {
+		g.snapshot = make(Snapshot)
 	}
-	diff := delta(other, s.snapshot)
+	diff := delta(other, g.snapshot)
 	for addr, diffValue := range diff {
-		if _, ok := s.snapshot[addr]; !ok {
-			s.snapshot[addr] = diffValue
+		if _, ok := g.snapshot[addr]; !ok {
+			g.snapshot[addr] = diffValue
 		} else {
 			for key, value := range diffValue {
-				s.snapshot[addr][key] = value
+				g.snapshot[addr][key] = value
 			}
 		}
 	}

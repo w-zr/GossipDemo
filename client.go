@@ -94,7 +94,7 @@ func Dial(network, address string) (client *client, err error) {
 	return NewClient(conn)
 }
 
-func (client *client) send(content Snapshot) {
+func (client *client) sendKnownVersions(content map[Address]uint64) {
 	client.sending.Lock()
 	if err := client.cc.Write(content); err != nil {
 		client.sending.Unlock()

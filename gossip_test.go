@@ -19,12 +19,12 @@ func TestGossip(t *testing.T) {
 		servers[i].Start()
 	}
 
-	servers[0].AddLocalState("a", "b")
+	servers[clusterSize-1].AddLocalState("a", "b")
 	start := time.Now()
 	for {
 		count := 0
 		for i := 0; i < clusterSize; i++ {
-			if _, ok := servers[i].GetSnapshot()[Address{Network: "tcp", Address: "127.0.0.1:20000"}]["a"]; ok {
+			if _, ok := servers[i].GetSnapshot()[Address{Network: "tcp", Address: servers[clusterSize-1].localAddress.Address}]["a"]; ok {
 				count++
 			}
 		}
